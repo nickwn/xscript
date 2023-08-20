@@ -5,7 +5,7 @@
 
 #include "extern/ctpg.hpp"
 
-#include "parse.hpp"
+#include "parser.hpp"
 
 #include "passes.hpp"
 #include "util.hpp"
@@ -21,8 +21,8 @@ int main()
         << source.get_view(std::begin(source), std::end(source)) << util::newl;
     
     ast::context<ast::sb_node> named_ctx;
-    auto parse_mod = parse(named_ctx);
-    const auto maybe_parsed = parse_mod(source);
+    auto parse = parser(named_ctx);
+    const auto maybe_parsed = parse(source);
 
     if (maybe_parsed)
     {
@@ -33,7 +33,15 @@ int main()
 
         ast::context<ast::rb_node> resolved_ctx;
         auto resolve_vars = passes::resolve_vars(named_ctx, resolved_ctx);
-        const auto resolved_mod = resolve_vars(named_mod);
+        auto resolved_mod = resolve_vars(named_mod);
+
+        auto evaluate = passes::evaluate(resolved_ctx);
+        auto val_gen = evaluate.gen(resolved_mod);
+
+        while (val_gen)
+        {
+            const id<ast::rb_node> val = val_gen();
+        }
     }
 
 }

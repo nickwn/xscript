@@ -32,7 +32,7 @@ struct string_binding
 struct resolved_binding
 {
 	const unsigned is_local : 1;
-	const unsigned idx : 24;
+	const unsigned idx : 31;
 
 	resolved_binding(const std::size_t is_local_, const std::size_t idx_) :
 		is_local(std::uint32_t(is_local_)), idx(std::uint32_t(idx_))
@@ -184,10 +184,22 @@ namespace prims
 		constexpr static auto name = make_hashed_string("boolean");
 	};
 
+	struct str : public node_variant_base<str>
+	{
+		constexpr static bool is_prim = true;
+		constexpr static auto name = make_hashed_string("str");
+	};
+
 	struct none : public node_variant_base<none>
 	{
 		constexpr static bool is_prim = true;
 		constexpr static auto name = make_hashed_string("none");
+	};
+
+	struct any : public node_variant_base<any>
+	{
+		constexpr static bool is_prim = true;
+		constexpr static auto name = make_hashed_string("any");
 	};
 
 	// type of all types
@@ -203,22 +215,28 @@ namespace prims
 		constexpr static auto name = make_hashed_string("fun");
 	};
 
-	struct anon_fun : public node_variant_base<anon_fun>
-	{
-		constexpr static bool is_prim = true;
-		constexpr static auto name = make_hashed_string("anon_fun");
-	};
-
 	struct add : public node_variant_base<add>
 	{
 		constexpr static bool is_prim = true;
 		constexpr static auto name = make_hashed_string("add");
 	};
 
+	struct sub : public node_variant_base<sub>
+	{
+		constexpr static bool is_prim = true;
+		constexpr static auto name = make_hashed_string("sub");
+	};
+
 	struct mul : public node_variant_base<mul>
 	{
 		constexpr static bool is_prim = true;
 		constexpr static auto name = make_hashed_string("mul");
+	};
+
+	struct div : public node_variant_base<div>
+	{
+		constexpr static bool is_prim = true;
+		constexpr static auto name = make_hashed_string("div");
 	};
 }
 
@@ -300,18 +318,21 @@ namespace nodes
 namespace detail
 {
 	template<typename N, typename... Prims>
-	using node_base_with_prims = std::variant<
+	using node_base_with_prims_t = std::variant<
 		nodes::constant<Prims>...,
 		nodes::var<N>,
 		nodes::app<N>,
 		nodes::lam<N>,
+		prims::add,
+		prims::sub,
+		prims::mul,
+		prims::div,
 		Prims...
 	>;
 
-	template<typename N, typename... NonTypePrims>
-	using node_base_with_non_type_prims_t = node_base_with_prims<
+	template<typename N>
+	using node_base_t = node_base_with_prims_t<
 		N,
-
 		prims::i<8>,
 		prims::i<16>,
 		prims::i<32>,
@@ -326,21 +347,14 @@ namespace detail
 		prims::f<32>,
 		prims::f<64>,
 
+		prims::boolean,
+
+		prims::str,
+
 		prims::none,
 		prims::type,
 
-		prims::fun,
-		prims::anon_fun,
-
-		NonTypePrims...
-	>;
-
-	template<typename N>
-	using node_base_t = node_base_with_non_type_prims_t<
-		N,
-
-		prims::add,
-		prims::mul
+		prims::fun
 	>;
 }
 
@@ -457,6 +471,13 @@ concept prim =
 	requires {
 		T::is_prim == true;
 	};
+
+template<typename T>
+concept prim_type =
+	ast::prim<T> && 
+	util::is_in_variant_v<nodes::constant<T>, 
+		detail::node_base_t<ast::rb_node>
+	>;
 
 static_assert(node<sb_node>);
 static_assert(node<rb_node>);

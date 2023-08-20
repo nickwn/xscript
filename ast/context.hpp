@@ -93,7 +93,7 @@ class traversal
 public:
 	template<typename... Args>
 	traversal(Args&&... args) :
-		traverser_(args...)
+		traverser_(std::forward<Args>(args)...)
 	{}
 
 	template<node N>
@@ -111,20 +111,32 @@ class context
 {
 public:
 	context() :
-		node_pool_(), interner_(node_pool_)
+		node_pool_(), interner_(node_pool_), builder_(interner_)
 	{
 		interner_.intern(prims::type().to<N>());
 	}
 
 	ast::builder<N> builder()
 	{
-		return ast::builder<N>(interner_);
+		return builder_;
 	}
+
+	node_interner<N>& interner() { return interner_; }
+	const node_interner<N>& interner() const { return interner_; }
+
+	pool_t<N>& pool() { return node_pool_; }
+	const pool_t<N>& pool() const { return node_pool_; }
 
 	template<typename Traverser, typename... Params>
 	ast::traversal<Traverser> traversal(Params&&... params) const
 	{
-		return ast::traversal<Traverser>(node_pool_, std::forward(params)...);
+		return ast::traversal<Traverser>(node_pool_, std::forward<Params>(params)...);
+	}
+
+	template<typename Traverser, typename... Params>
+	ast::traversal<Traverser> traversal(Params&&... params)
+	{
+		return ast::traversal<Traverser>(node_pool_, std::forward<Params>(params)...);
 	}
 
 	template<typename Traverser>
@@ -136,6 +148,7 @@ public:
 private:
 	pool_t<N> node_pool_;
 	node_interner<N> interner_;
+	ast::builder<N> builder_;
 };
 
 } // namespace ast

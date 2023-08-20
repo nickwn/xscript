@@ -1,6 +1,9 @@
 #pragma once
 
+#include <cassert>
 #include <format>
+#include <queue>
+#include <coroutine>
 
 #include "util.hpp"
 
@@ -111,7 +114,12 @@ namespace node_passes
 
 		id<ast::rb_node> operator()(const ast::nodes::var<ast::sb_node>& v, ast::builder<ast::rb_node>& b, env& e, const std::size_t i) const
 		{
-			return b.build(ast::nodes::var<ast::rb_node>(e.at(v.bind)));
+			const ast::resolved_binding global_rb = e.at(v.bind);
+			const ast::resolved_binding local_rb = global_rb.is_local ? 
+				ast::resolved_binding(true, i - global_rb.idx) : 
+				global_rb;
+			
+			return b.build(ast::nodes::var<ast::rb_node>(local_rb));
 		}
 
 		id<ast::rb_node> operator()(const ast::nodes::app<ast::sb_node>& v, ast::builder<ast::rb_node>& b, env& e, const std::size_t i) const
@@ -131,7 +139,6 @@ namespace node_passes
 		}
 	};
 }
-
 
 class resolve_vars
 {
@@ -192,136 +199,627 @@ private:
 	ast::context<ast::rb_node>& out_ctx_;
 };
 
+template<bool has_value, typename T>
+struct optional_value : T {};
+
 struct typed_value
 {
 	const std::uint64_t value;
 	const id<ast::rb_node> type;
-};
-
-struct typed_stack
-{
-	std::vector<std::uint64_t> values;
-	std::vector<id<ast::rb_node>> types;
-
-	typed_value at(const std::size_t i) const
+	
+	static typed_value thunk(const id<ast::rb_node> node)
 	{
 		return typed_value{
-			.value = values.at(i),
-			.type = types.at(i)
+			.value = util::zero_pad_bit_cast<std::uint64_t>(node),
+			.type = invalid_id<ast::rb_node>
 		};
 	}
 
-	auto scoped_push(const typed_value& tv)
+	static typed_value invalid()
+	{
+		return typed_value{
+			.value = invalid_id<ast::rb_node>,
+			.type = invalid_id<ast::rb_node>
+		};
+	}
+
+	bool is_ip() const
+	{
+		return type == invalid_id<ast::rb_node>;
+	}
+
+	id<ast::rb_node> as_ip() const
+	{
+		return util::truncate_bit_cast<id<ast::rb_node>>(value);
+	}
+};
+
+class lazy_stack
+{
+public:
+	lazy_stack() :
+		sp_(0), values_()
+	{}
+
+	id<ast::rb_node> at(const std::size_t i) const
+	{
+		return values_.at(idx(i));
+	}
+
+	id<ast::rb_node>& at(const std::size_t i)
+	{
+		return values_.at(idx(i));
+	}
+
+	auto scoped_push(const id<ast::rb_node> elem)
 	{
 		struct scoped_push_
 		{
-			typed_stack& stack;
+			lazy_stack& stack;
 
-			scoped_push_(typed_stack& stack_, typed_value tv) :
+			scoped_push_(lazy_stack& stack_, id<ast::rb_node> elem_) :
 				stack(stack_)
 			{
-				stack.values.push_back(tv.value);
-				stack.types.push_back(tv.type);
+				stack.values_.push_back(elem_);
 			}
 
 			~scoped_push_()
 			{
-				stack.values.pop_back();
-				stack.types.pop_back();
+				stack.values_.pop_back();
 			}
 
-			operator typed_stack& ()
+			operator lazy_stack& ()
 			{
 				return stack;
 			}
 		};
 
-		return scoped_push_(*this, tv);
+		return scoped_push_(*this, elem);
 	}
+
+	auto scoped_frame()
+	{
+		struct scoped_frame_
+		{
+			lazy_stack& stack;
+
+			scoped_frame_(lazy_stack& stack_) :
+				stack(stack_)
+			{
+				stack.sp_++;
+			}
+
+			~scoped_frame_()
+			{
+				stack.sp_--;
+			}
+
+			operator lazy_stack& ()
+			{
+				return stack;
+			}
+		};
+
+		return sp_ < values_.size() ? std::optional(scoped_frame_(*this)) : std::optional<scoped_frame_>();
+	}
+
+	auto scoped_rewind(const std::size_t to_i_local)
+	{
+		struct scoped_rewind_
+		{
+			lazy_stack& stack;
+			const std::size_t from_i;
+
+			scoped_rewind_(lazy_stack& stack_, const std::size_t to_i) :
+				stack(stack_), from_i(stack_.sp_)
+			{
+				stack.sp_ = to_i;
+			}
+
+			~scoped_rewind_()
+			{
+				stack.sp_ = from_i;
+			}
+
+			operator lazy_stack& ()
+			{
+				return stack;
+			}
+		};
+
+		return scoped_rewind_(*this, idx(to_i_local));
+	}
+
+private:
+	std::size_t idx(const std::size_t i) const
+	{
+		assert(sp_ >= i);
+		assert(sp_ <= values_.size());
+
+		return sp_ - i;
+	}
+
+	std::size_t sp_;
+	std::vector<id<ast::rb_node>> values_;
 };
 
 namespace node_passes
 {
-	class evaluate : public ast::traverser<evaluate, ast::rb_node, typed_value(id<ast::rb_node>, typed_stack&)>
+	namespace detail
+	{
+		template<typename T>
+		struct cpp_type;
+
+		template<> struct cpp_type<ast::prims::i<8>> : public util::type_constant<std::int8_t> {};
+		template<> struct cpp_type<ast::prims::i<16>> : public util::type_constant<std::int16_t> {};
+		template<> struct cpp_type<ast::prims::i<32>> : public util::type_constant<std::int32_t> {};
+		template<> struct cpp_type<ast::prims::i<64>> : public util::type_constant<std::int64_t> {};
+
+		template<> struct cpp_type<ast::prims::u<8>> : public util::type_constant<std::uint8_t> {};
+		template<> struct cpp_type<ast::prims::u<16>> : public util::type_constant<std::uint16_t> {};
+		template<> struct cpp_type<ast::prims::u<32>> : public util::type_constant<std::uint32_t> {};
+		template<> struct cpp_type<ast::prims::u<64>> : public util::type_constant<std::uint64_t> {};
+
+		template<> struct cpp_type<ast::prims::f<16>> : public util::type_constant<std::uint16_t> {};
+		template<> struct cpp_type<ast::prims::f<32>> : public util::type_constant<float> {};
+		template<> struct cpp_type<ast::prims::f<64>> : public util::type_constant<double> {};
+
+		template<> struct cpp_type<ast::prims::boolean> : public util::type_constant<bool> {};
+
+		template<typename T>
+		concept type_prim = requires {
+			typename cpp_type<T>::type;
+		};
+
+		template<typename T>
+		using cpp_type_t = cpp_type<T>::type;
+
+		struct add_
+		{
+			template<typename T> requires std::is_trivially_copyable_v<T>
+			T operator()(const T v0, const T v1) const
+			{
+				return v0 + v1;
+			}
+		};
+
+		static constexpr add_ add;
+
+		template<typename T, typename Fn>
+		auto binop_wrap_cast(Fn&& fn)
+		{
+			return [&fn](const std::uint64_t v0, const std::uint64_t v1) {
+				return util::zero_pad_bit_cast<std::uint64_t>(
+					fn(util::truncate_bit_cast<T>(v0), util::truncate_bit_cast<T>(v1))
+				);
+			};
+		}
+
+		template<typename Fn>
+		struct binop_visitor
+		{
+			const Fn fn;
+			const std::uint64_t v0, v1;
+			const ast::node_interner<ast::rb_node>& interner;
+
+			template<type_prim P>
+			std::optional<typed_value> operator()(const P&, const P&)
+			{
+				using type = cpp_type_t<P>;
+
+				return typed_value{
+					.value = binop_wrap_cast<type>(fn)(v0, v1),
+					.type = interner.get(P{}.to<ast::rb_node>())
+				};
+			}
+
+			std::optional<typed_value> operator()(const auto&, const auto&) 
+			{
+				return std::optional<typed_value>();
+			}
+		};
+	}
+
+	class evaluate : 
+		public ast::traverser<evaluate, ast::rb_node, typed_value(id<ast::rb_node>, lazy_stack&)>
 	{
 	public:
-		evaluate(pool_t<ast::rb_node>& node_pool, const ast::mod<ast::rb_node>& mod) :
-			traverser(node_pool), mod_(mod), node_pool_(node_pool),
-			type_id_(node_pool.emplace(ast::prims::type())),
-			fun_id_(node_pool.emplace(ast::prims::fun()))
+		evaluate(pool_t<ast::rb_node>&, ast::context<ast::rb_node>& ctx, ast::mod<ast::rb_node>& mod) :
+			traverser(ctx.pool()), ctx_(ctx), mod_(mod), cache_start_(ctx.pool().size())
 		{}
 
-		template<ast::prim P>
-		typed_value operator()(const P&, const id<ast::rb_node> id, typed_stack&) const
+		typed_value operator()(const ast::prims::add&, const id<ast::rb_node> id, lazy_stack& stack) const
 		{
+			if (stack.scoped_frame() && stack.scoped_frame())
+			{
+				const typed_value a0 = eval_local_var(0, stack);
+				const typed_value a1 = eval_local_var(1, stack);
+
+				auto maybe_res_val = std::visit(
+					make_binop_visitor(detail::add, a0, a1), 
+					pool().get(a0.type),
+					pool().get(a1.type)
+				);
+
+				return maybe_res_val.value_or(typed_value{
+					.value = invalid_id<ast::rb_node>,
+					.type = invalid_id<ast::rb_node>
+				});
+			}
+
 			return typed_value{
-				.value = std::uint64_t(id),
-				.type = type_id_
+				.value = id,
+				.type = invalid_id<ast::rb_node>
+			};
+		}
+
+		// simple type check
+		template<ast::prim P>
+		typed_value operator()(const P&, const id<ast::rb_node> id, lazy_stack& stack) const
+		{
+			if (stack.scoped_frame())
+			{
+				const typed_value a0 = eval_local_var(0, stack);
+				const bool is_type = a0.type == interner().get(P{}.to<ast::rb_node>());
+				return typed_value{
+					.value = util::zero_pad_bit_cast<std::uint64_t>(is_type),
+					.type = interner().get(ast::prims::boolean{}.to<ast::rb_node>())
+				};
+			}
+
+			return typed_value{
+				.value = id,
+				.type = invalid_id<ast::rb_node>
 			};
 		}
 
 		template<ast::prim P>
-		typed_value operator()(const ast::nodes::constant<P>& v, const id<ast::rb_node> id, typed_stack&) const
+		typed_value operator()(const ast::nodes::constant<P>& v, const id<ast::rb_node> id, lazy_stack&) const
 		{
 			return typed_value{
 				.value = v.payload,
-				.type = id
+				.type = interner().get(P{}.to<ast::rb_node>())
 			};
 		}
 
-		typed_value operator()(const ast::nodes::var<ast::rb_node>& v, const id<ast::rb_node> id, typed_stack& stack) const
+		typed_value operator()(const ast::nodes::var<ast::rb_node>& v, const id<ast::rb_node>, lazy_stack& stack) const
 		{
-			return v.bind.is_local ? stack.at(v.bind.idx) : typed_value{
-				.value = std::uint64_t(mod_.defs.at(v.bind.idx)),
-				.type = mod_.decls.at(v.bind.idx).type
-			};
+			return v.bind.is_local ? eval_local_var(v.bind.idx, stack) : eval_global_var(v.bind.idx, stack);
 		}
 
-		typed_value operator()(const ast::nodes::app<ast::rb_node>& v, const id<ast::rb_node> id, typed_stack& stack) const
+		typed_value operator()(const ast::nodes::app<ast::rb_node>& v, const id<ast::rb_node> cur_id, lazy_stack& stack) const
 		{
-			const typed_value v1 = traverse_(v.expr1, stack);
-			const typed_value v0 = traverse_(v.expr0, stack.scoped_push(v1));
-			return v0;
+			const typed_value v0 = traverse_(v.expr0, stack);
+			if (!v0.is_ip())
+			{
+				// error
+				return typed_value{
+					.value = invalid_id<ast::rb_node>,
+					.type = invalid_id<ast::rb_node>
+				};
+			}
+
+			const id<ast::rb_node> ip = v0.as_ip();
+			const typed_value prim_res = traverse_(ip, stack.scoped_push(v.expr1));
+			const typed_value lazy_res = typed_value::thunk(cur_id);
+			return prim_res.is_ip() ? lazy_res : prim_res; // TODO: remove branch somehow?
 		}
 
-		typed_value operator()(const ast::nodes::lam<ast::rb_node>& v, const id<ast::rb_node> id, typed_stack& stack) const
+		typed_value operator()(const ast::nodes::lam<ast::rb_node>& v, const id<ast::rb_node> id, lazy_stack& stack) const
 		{
-			return typed_value{
-				.value = std::uint64_t(id),
-				.type = fun_id_
+			return stack.scoped_frame() ? traverse_(v.expr, stack) : typed_value{
+				.value = id,
+				.type = invalid_id<ast::rb_node>
 			};
 		}
 
 	private:
-
-		typed_value traverse_(const id<ast::rb_node> id, typed_stack& stack) const
+		typed_value traverse_(const id<ast::rb_node> id, lazy_stack& stack) const
 		{
 			return traverse(id, id, stack);
 		}
 
-		const ast::mod<ast::rb_node>& mod_;
-		const pool_t<ast::rb_node>& node_pool_;
+		bool is_cached_id(const id<ast::rb_node> i) const
+		{
+			return i.idx >= cache_start_;
+		}
 
-		const id<ast::rb_node> type_id_;
-		const id<ast::rb_node> fun_id_;
+		template<typename Fn>
+		auto make_binop_visitor(const Fn& fn_, const typed_value& a0_, const typed_value& a1_) const
+		{
+			return detail::binop_visitor<std::decay_t<Fn>>{
+				.fn = fn_,
+				.v0 = a0_.value,
+				.v1 = a1_.value,
+				.interner = interner()
+			};
+		}
+
+		template<typename Storage, typename TraverseFn>
+		typed_value eval_var(const std::size_t i, Storage& stack, TraverseFn&& traverse_fn) const
+		{
+			const id<ast::rb_node> ip = stack.at(i);
+			// TODO: merge branch with below
+			if (is_cached_id(ip))
+			{
+				lazy_stack tmp_stack;
+				const typed_value var_tv = traverse_(ip, tmp_stack);
+				return var_tv;
+			}
+
+			// lambda to enforce scope
+			const typed_value var_tv = traverse_fn(ip);
+			const ast::rb_node& var_type = pool().get(var_tv.type);
+			const ast::rb_node new_imm = std::visit(util::overloaded{
+					[val = var_tv.value](const ast::prim_type auto& t) {
+						return ast::nodes::constant<std::decay_t<decltype(t)>>(val)
+							.to<ast::rb_node>();
+					},
+					[](const auto& t) {
+						util::unreachable("eval type is not prim");
+						return ast::prims::none().to<ast::rb_node>();
+					}
+				},
+				var_type
+			);
+
+			const id<ast::rb_node> new_imm_id = pool().emplace(new_imm);
+			stack.at(i) = new_imm_id;
+
+			return var_tv;
+		}
+
+		typed_value eval_local_var(const std::size_t i, lazy_stack& stack) const
+		{
+			return eval_var(i, stack, 
+				[&](const id<ast::rb_node> ip){ 
+					return traverse_(ip, stack.scoped_rewind(i)); 
+				}
+			);
+		}
+
+		typed_value eval_global_var(const std::size_t i, lazy_stack& stack) const
+		{
+			return eval_var(i, mod_.get().defs,
+				[&](const id<ast::rb_node> ip) {
+					return traverse_(ip, stack);
+				}
+			);
+		}
+
+		ast::node_interner<ast::rb_node>& interner() const { return ctx_.get().interner(); }
+		pool_t<ast::rb_node>& pool() const { return ctx_.get().pool(); }
+
+		// TODO reference_wrapper
+		std::reference_wrapper<ast::context<ast::rb_node>> ctx_;
+		std::reference_wrapper<ast::mod<ast::rb_node>> mod_;
+		std::size_t cache_start_;
 	};
 }
-/*
-class evaluate
-{
-public:
-	evaluate(const ast::context<ast::rb_node>& ctx) :
-		node_evaluate_(ctx.traversal<node_passes::evaluate>())
-	{}
 
-	void operator()(const ast::mod<ast::rb_node>& mod)
+template <typename T>
+struct generator
+{
+	struct promise_type;
+	using handle_type = std::coroutine_handle<promise_type>;
+
+	struct promise_type // required
 	{
-		
+		T value_;
+		std::exception_ptr exception_;
+
+		generator get_return_object()
+		{
+			return generator(handle_type::from_promise(*this));
+		}
+		std::suspend_always initial_suspend() { return {}; }
+		std::suspend_always final_suspend() noexcept { return {}; }
+		void unhandled_exception() { exception_ = std::current_exception(); } // saving
+		// exception
+
+		template <std::convertible_to<T> From> // C++20 concept
+		std::suspend_always yield_value(From&& from)
+		{
+			value_ = std::forward<From>(from); // caching the result in promise
+			return {};
+		}
+		void return_void() { }
+	};
+
+	handle_type h_;
+
+	generator(handle_type h)
+		: h_(h)
+	{
+	}
+	~generator() { h_.destroy(); }
+	explicit operator bool()
+	{
+		fill();
+		return !h_.done();
+	}
+
+	T operator()()
+	{
+		fill();
+		full_ = false;
+		return std::move(h_.promise().value_);
 	}
 
 private:
-	ast::traversal<node_passes::evaluate> node_evaluate_;
-};*/
+	bool full_ = false;
+
+	void fill()
+	{
+		if (!full_)
+		{
+			h_();
+			if (h_.promise().exception_)
+			{
+				std::rethrow_exception(h_.promise().exception_);
+			}
+
+			full_ = true;
+		}
+	}
+};
+
+class evaluate
+{
+public:
+	evaluate(ast::context<ast::rb_node>& ctx) : 
+		ctx_(ctx)
+	{}
+
+	generator<id<ast::rb_node>> gen(ast::mod<ast::rb_node> mod)
+	{
+		lazy_stack stack;
+		using namespace std::placeholders;
+		const auto evaluate_expr = std::bind(
+			ctx_.get().traversal<node_passes::evaluate>(ctx_.get(), mod),
+			_1, _1, stack
+		);
+
+		struct typed_expr
+		{
+			const id<ast::rb_node> expr;
+			const id<ast::rb_node> type;
+		};
+
+		auto is_live = [](const std::tuple<ast::decl<ast::rb_node>, id<ast::rb_node>>& decl_def) { 
+			return std::get<ast::decl<ast::rb_node>>(decl_def).quals == ast::qualifier::live; 
+		};
+		auto is_rank_zero = [&evaluate_expr](const std::tuple<ast::decl<ast::rb_node>, id<ast::rb_node>>& decl_def) {
+			const id<ast::rb_node> expr_id = std::get<id<ast::rb_node>>(decl_def);
+			return !evaluate_expr(expr_id).is_ip();
+		};
+
+		auto get_decl_node = [](const std::tuple<ast::decl<ast::rb_node>, id<ast::rb_node>>& decl_def) {
+			return std::get<id<ast::rb_node>>(decl_def);
+		};
+		auto to_typed_expr = [](const std::tuple<ast::decl<ast::rb_node>, id<ast::rb_node>>& decl_def) {
+			const id<ast::rb_node> expr_id = std::get<id<ast::rb_node>>(decl_def);
+			const ast::decl<ast::rb_node>& decl = std::get<ast::decl<ast::rb_node>>(decl_def);
+			return typed_expr{
+				.expr = expr_id,
+				.type = decl.type
+			};
+		};
+
+		auto live_nodes = util::ranges::zip(mod.decls, mod.defs) |
+			std::views::filter(is_live);
+		auto root_live_nodes = live_nodes | 
+			std::views::filter(is_rank_zero) |
+			std::views::transform(get_decl_node);
+		auto internal_live_nodes = live_nodes |
+			std::views::filter(std::not_fn(is_rank_zero)) |
+			std::views::transform(to_typed_expr);
+
+		struct value_queue
+		{
+			std::size_t cur_idx = 0;
+			std::vector<id<ast::rb_node>> data;
+
+			void push_back(const id<ast::rb_node> n) { data.push_back(n); }
+			id<ast::rb_node> front() const { return data.at(cur_idx); }
+			void pop() { cur_idx++; }
+			bool empty() const { return cur_idx == data.size(); }
+		};
+
+		value_queue values;
+		std::vector<typed_expr> typed_funs;
+		util::push_back_range(values, root_live_nodes);
+		util::push_back_range(typed_funs, internal_live_nodes);
+		while (!values.empty())
+		{
+			const id<ast::rb_node> cur = values.front();
+			co_yield cur;
+
+			auto make_app = [this, cur](const id<ast::rb_node> expr_id) {
+				return interner().intern(ast::nodes::app<ast::rb_node>(expr_id, cur));
+			};
+			auto type_check = [this, &make_app, &evaluate_expr](const id<ast::rb_node> type) {
+				const id<ast::rb_node> tmp_app = make_app(type);
+				return bool(evaluate_expr(tmp_app).value);
+			};
+
+			const std::size_t evaluators_size = typed_funs.size();
+			for (std::size_t i = 0; i < evaluators_size; i++)
+			{
+				const typed_expr& typed_fun = typed_funs.at(i);
+				const std::optional<fun_type> maybe_ft = decomp_fun_type(typed_fun.type);
+				if (!maybe_ft)
+				{
+					co_return;
+				}
+
+				const fun_type& ft = maybe_ft.value();
+				if (!type_check(ft.arg))
+				{
+					continue;
+				}
+
+				const id<ast::rb_node> tmp_app = make_app(typed_fun.expr);
+				const bool is_evaluated = !evaluate_expr(tmp_app).is_ip();
+				// TODO: type check return
+
+				if (is_evaluated)
+				{
+					values.push_back(tmp_app);
+				}
+				else
+				{
+					typed_funs.push_back(typed_expr{
+						.expr = tmp_app,
+						.type = ft.ret
+					});
+				}
+			}
+
+			values.pop();
+		}
+	}
+
+private:
+
+	struct fun_type
+	{
+		id<ast::rb_node> arg;
+		id<ast::rb_node> ret;
+	};
+
+	std::optional<fun_type> decomp_fun_type(const id<ast::rb_node> type_id) const
+	{
+		const ast::rb_node& type = pool().get(type_id);
+		const bool has_ret_app = std::holds_alternative<ast::nodes::app<ast::rb_node>>(type);
+		if (has_ret_app)
+		{
+			auto ret_app = std::get<ast::nodes::app<ast::rb_node>>(type);
+			const ast::rb_node& ret_app0 = pool().get(ret_app.expr0);
+			const bool has_arg_app = std::holds_alternative<ast::nodes::app<ast::rb_node>>(ret_app0);
+			if (has_arg_app)
+			{
+				auto arg_app = std::get<ast::nodes::app<ast::rb_node>>(ret_app0);
+				const ast::rb_node& arg_app0 = pool().get(arg_app.expr0);
+				const bool is_fun = std::holds_alternative<ast::prims::fun>(arg_app0);
+				if (is_fun)
+				{
+					return fun_type{
+						.arg = arg_app.expr1,
+						.ret = ret_app.expr1
+					};
+				}
+			}
+		}
+
+		return std::optional<fun_type>();
+	}
+
+	ast::node_interner<ast::rb_node>& interner() const { return ctx_.get().interner(); }
+	pool_t<ast::rb_node>& pool() const { return ctx_.get().pool(); }
+
+	std::reference_wrapper<ast::context<ast::rb_node>> ctx_;
+};
 
 
 } // namespace passes

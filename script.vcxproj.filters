@@ -36,7 +36,7 @@
     <ClInclude Include="passes.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="parse.hpp">
+    <ClInclude Include="parser.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -47,7 +47,7 @@
     <ClCompile Include="ast\context.cpp">
       <Filter>Source Files\ast</Filter>
     </ClCompile>
-    <ClCompile Include="parse.cpp">
+    <ClCompile Include="parser.cpp">
       <Filter>Source Files\ast</Filter>
     </ClCompile>
   </ItemGroup>
@@ -55,5 +55,7 @@
     <None Include="test\test.xs">
       <Filter>Resource Files</Filter>
     </None>
+    <None Include=".gitignore" />
+    <None Include="README.md" />
   </ItemGroup>
 </Project>

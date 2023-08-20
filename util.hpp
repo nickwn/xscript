@@ -1,6 +1,7 @@
 
 #pragma once
 #include <span>
+#include <queue>
 #include <deque>
 #include <tuple>
 #include <string>
@@ -84,6 +85,38 @@ namespace util
 		}
 
 		return res;
+	}
+
+	template<class To, class From>
+	requires 
+		(sizeof(From) <= sizeof(To)) && 
+		std::is_trivially_copyable_v<From> && 
+		std::is_trivially_copyable_v<To>
+	static To zero_pad_bit_cast(const From& src)
+	{
+		union
+		{
+			To t;
+			From f;
+		} u = { .f = src };
+
+		return u.t;
+	}
+
+	template<class To, class From>
+	requires 
+		(sizeof(From) >= sizeof(To)) && 
+		std::is_trivially_copyable_v<From> && 
+		std::is_trivially_copyable_v<To>
+	static To truncate_bit_cast(const From& src)
+	{
+		union
+		{
+			To t;
+			From f;
+		} u = { .f = src };
+
+		return u.t;
 	}
 
 	template<std::size_t N>
@@ -311,6 +344,39 @@ namespace util
 		}
 	}
 
+	template<class... Ts>
+	struct overloaded : Ts... { using Ts::operator()...; };
+
+	template<typename T>
+	struct type_constant
+	{
+		using type = T;
+	};
+
+	// coming in c++23
+	template<typename T, std::ranges::input_range Rng>
+	static void push_range(std::queue<T>& q, Rng&& rng)
+	{
+		for (const auto& v : rng)
+		{
+			q.push(v);
+		}
+	}
+
+	template<typename Container, std::ranges::input_range Rng>
+	static void push_back_range(Container& q, Rng&& rng)
+	{
+		for (const auto& v : rng)
+		{
+			q.push_back(v);
+		}
+	}
+
+	[[noreturn]] static void unreachable(const std::string_view)
+	{
+		__assume(false);
+	}
+
 	// shitty ranges library for things not implemented in c++20
 	namespace ranges
 	{
@@ -373,13 +439,13 @@ namespace util
 			struct insert_
 			{
 				template<typename T>
-				void operator()(std::vector<T>& c, T&& v)
+				void operator()(std::vector<T>& c, T&& v) const
 				{
 					c.push_back(v);
 				}
 
 				template<typename K, typename V, typename H, typename E>
-				void operator()(ska::bytell_hash_map<K, V, H, E>& c, std::pair<K, V> v)
+				void operator()(ska::bytell_hash_map<K, V, H, E>& c, std::pair<K, V> v) const
 				{
 					c.insert(std::move(v));
 				}
@@ -404,6 +470,7 @@ namespace util
 		class zip : public std::ranges::view_interface<zip<Rs...>>
 		{
 		public:
+			class iterator;
 			class sentinel
 			{
 				friend class iterator;
@@ -414,6 +481,10 @@ namespace util
 					: ends_(std::move(ends))
 				{}
 
+				bool operator==(const iterator& other) const;
+
+				bool operator!=(const iterator& other) const;
+
 			private:
 				std::tuple<std::ranges::sentinel_t<const Rs>...> ends_;
 			};
@@ -421,6 +492,8 @@ namespace util
 			class iterator
 			{
 			public:
+				friend class sentinel;
+
 				using iterator_category = std::input_iterator_tag;
 				using value_type = std::tuple<std::ranges::range_value_t<Rs>...>;
 				using difference_type = std::common_type_t<std::ranges::range_difference_t<Rs>...>;
@@ -452,7 +525,7 @@ namespace util
 					return tuple_fold(
 						tuple_map(l.iters_, r.iters_, detail::distance_to),
 						std::numeric_limits<difference_type>::max(),
-						detail::min_{}
+						detail::min
 					);
 				}
 
@@ -523,15 +596,34 @@ namespace util
 			std::tuple<Rs...> rngs_;
 		};
 
+		template<std::ranges::input_range... Rs>
+		bool zip<Rs...>::sentinel::operator==(const iterator& other) const
+		{
+			return tuple_fold(
+				tuple_map(ends_, other.iters_, detail::equal_to),
+				false,
+				detail::or_
+			);
+		}
+
+		template<std::ranges::input_range... Rs>
+		bool zip<Rs...>::sentinel::operator!=(const iterator& other) const
+		{
+			return !(*this == other);
+		}
+
 		template <std::ranges::input_range R>
 		constexpr std::ranges::input_range auto enumerate(const R& r)
 		{
+			static_assert(std::ranges::input_range<std::ranges::iota_view<std::size_t>>);
 			using zip_type = zip<std::ranges::iota_view<std::size_t>, R>;
-			
-			return zip_type(
-				std::views::iota(std::size_t(0)), 
+
+			auto res = zip_type(
+				std::views::iota(std::size_t(0)),
 				r
 			);
+
+			return res;
 		}
 	}
 }
@@ -556,7 +648,7 @@ struct id
 };
 
 template<typename T>
-constexpr static id<T> invalid_id = id<T>(std::numeric_limits<id<T>::type>::max());
+constexpr static id<T> invalid_id = id<T>(std::numeric_limits<typename id<T>::type>::max());
 
 template<typename T>
 id<T>::id() : id(invalid_id<T>) {}
@@ -596,6 +688,11 @@ public:
 	const T& get(id<T> i) const 
 	{
 		return *reinterpret_cast<const T*>(&data_[i.idx]);
+	}
+
+	std::size_t size() const
+	{
+		return data_.size();
 	}
 
 private:
